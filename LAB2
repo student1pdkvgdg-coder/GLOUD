@@ -1,0 +1,374 @@
+cat > lab5.sh <<'LABEOF'
+#!/bin/bash
+# ARC134 - Complete Challenge Lab Script
+
+ask() { local r; read -e -r -p "$2 [$3]: " r; printf -v "$1" '%s' "${r:-$3}"; }
+die() { echo; echo "STOP: $1"; exit 1; }
+
+PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
+if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
+  die "No project set. Open Cloud Shell from the active lab."
+fi
+
+export PROJECT_ID
+echo "Project: $PROJECT_ID"
+
+# ---------- DETECT REGION / ZONE ----------
+meta() {
+  gcloud compute project-info describe --quiet \
+    --format="value(commonInstanceMetadata.items[$1])" 2>/dev/null </dev/null
+}
+
+DET_REGION=$(gcloud config get-value compute/region 2>/dev/null)
+[ -z "$DET_REGION" ] || [ "$DET_REGION" = "(unset)" ] && DET_REGION=$(meta google-compute-default-region)
+
+DET_ZONE=$(gcloud config get-value compute/zone 2>/dev/null)
+[ -z "$DET_ZONE" ] || [ "$DET_ZONE" = "(unset)" ] && DET_ZONE=$(meta google-compute-default-zone)
+
+if [ -z "$DET_REGION" ]; then
+  echo "Could not detect region. Enter the region from lab instructions."
+  DET_REGION="us-central1"
+fi
+
+echo
+echo "=== Enter lab values (press Enter for defaults) ==="
+
+ask REGION "Region" "$DET_REGION"
+
+if [ "$REGION" = "$DET_REGION" ] && [ -n "$DET_ZONE" ]; then
+  ZDEF="$DET_ZONE"
+else
+  ZDEF="${REGION}-b"
+fi
+
+ask ZONE "Zone" "$ZDEF"
+ask SA_NAME "Task 2: service account name" "devops"
+ask VM1 "Task 4: VM name" "vm-2"
+ask ROLE_ID "Task 5: custom role ID" "editor"
+ask ROLE_TITLE "Task 5: custom role title" "Editor"
+ask BQ_SA_NAME "Task 6: service account name" "bigquery-qwiklab"
+ask BQ_VM "Task 6: VM name" "bigquery-instance"
+ask MACHINE "Machine type" "e2-medium"
+ask PAUSE "Pause for progress checks? (y/n)" "y"
+
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+BQ_SA_EMAIL="${BQ_SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+ROLE_FILE="role-definition.yaml"
+
+gcloud config set compute/region "$REGION" >/dev/null 2>&1
+gcloud config set compute/zone "$ZONE" >/dev/null 2>&1
+
+pause() {
+  if [ "$PAUSE" = "y" ]; then
+    read -r -p ">>> Click Check my progress for: $1, then press ENTER " _
+  fi
+}
+
+grant() {
+  local i
+  for i in 1 2 3 4 5 6; do
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+      --member="$1" --role="$2" --condition=None >/dev/null 2>&1 &&
+      { echo "   granted $2"; return 0; }
+    sleep 8
+  done
+  echo "   WARNING: could not grant $2 to $1"
+  return 1
+}
+
+ssh_retry() {
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if gcloud compute ssh "$1" --zone="$ZONE" --quiet --command="$2"; then
+      return 0
+    fi
+    echo "SSH not ready (try $i/8). Waiting 20 seconds..."
+    sleep 20
+  done
+  return 1
+}
+
+make_sa() {
+  if gcloud iam service-accounts describe "$2" >/dev/null 2>&1; then
+    echo "Service account $1 already exists"
+  else
+    gcloud iam service-accounts create "$1" --display-name="$1" ||
+      die "Could not create service account $1"
+  fi
+
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    gcloud iam service-accounts describe "$2" >/dev/null 2>&1 && return 0
+    sleep 5
+  done
+  die "Service account did not become available: $2"
+}
+
+echo
+echo "=== Enabling APIs ==="
+
+gcloud services enable compute.googleapis.com iam.googleapis.com \
+  bigquery.googleapis.com cloudresourcemanager.googleapis.com --quiet
+
+# ---------- TASK 2 ----------
+echo
+echo "=== TASK 2: Create devops service account ==="
+
+make_sa "$SA_NAME" "$SA_EMAIL"
+pause "Task 2 - Create service account (20)"
+
+# ---------- TASK 3 ----------
+echo
+echo "=== TASK 3: Grant IAM permissions ==="
+
+export SA="$SA_EMAIL"
+
+grant "serviceAccount:$SA_EMAIL" roles/iam.serviceAccountUser
+grant "serviceAccount:$SA_EMAIL" roles/compute.instanceAdmin.v1
+grant "serviceAccount:$SA_EMAIL" roles/compute.instanceAdmin
+
+pause "Task 3 - Grant IAM permissions (20)"
+
+# ---------- TASK 4 ----------
+echo
+echo "=== TASK 4: Create VM with devops service account ==="
+
+if gcloud compute instances describe "$VM1" --zone="$ZONE" >/dev/null 2>&1; then
+  echo "VM $VM1 already exists"
+else
+  gcloud compute instances create "$VM1" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE" \
+    --service-account="$SA_EMAIL" \
+    --scopes=cloud-platform || die "Could not create $VM1"
+fi
+
+echo "--- SSH verification ---"
+
+ssh_retry "$VM1" \
+  "gcloud compute instances list --project=$PROJECT_ID --format='table(name,zone.basename(),status)'" ||
+  echo "SSH verification did not finish."
+
+pause "Task 4 - Create compute instance (20)"
+
+# ---------- TASK 5 ----------
+echo
+echo "=== TASK 5: Create custom role ==="
+
+cat > "$ROLE_FILE" <<EOF
+title: "${ROLE_TITLE}"
+description: "Custom role with Cloud SQL connect and get permissions"
+stage: "GA"
+includedPermissions:
+- cloudsql.instances.connect
+- cloudsql.instances.get
+EOF
+
+cat "$ROLE_FILE"
+
+if gcloud iam roles describe "$ROLE_ID" --project="$PROJECT_ID" >/dev/null 2>&1; then
+  echo "Role exists - updating it from the file"
+  gcloud iam roles undelete "$ROLE_ID" \
+    --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+
+  gcloud iam roles update "$ROLE_ID" \
+    --project="$PROJECT_ID" --file="$ROLE_FILE" --quiet
+else
+  gcloud iam roles create "$ROLE_ID" \
+    --project="$PROJECT_ID" --file="$ROLE_FILE" ||
+    die "Could not create custom role"
+fi
+
+pause "Task 5 - Create custom role (20)"
+
+# =====================================================
+# TASK 6 - ENHANCED BIGQUERY SECTION
+# =====================================================
+
+echo
+echo "=== TASK 6: BigQuery service account ==="
+
+make_sa "$BQ_SA_NAME" "$BQ_SA_EMAIL"
+
+grant "serviceAccount:$BQ_SA_EMAIL" roles/bigquery.dataViewer
+grant "serviceAccount:$BQ_SA_EMAIL" roles/bigquery.user
+
+echo
+echo "=== Creating BigQuery VM ==="
+
+if gcloud compute instances describe "$BQ_VM" --zone="$ZONE" >/dev/null 2>&1; then
+  echo "VM $BQ_VM already exists"
+else
+  gcloud compute instances create "$BQ_VM" \
+    --zone="$ZONE" \
+    --machine-type="$MACHINE" \
+    --service-account="$BQ_SA_EMAIL" \
+    --scopes=cloud-platform || die "Could not create BigQuery VM"
+fi
+
+# ---------- PYTHON QUERY ----------
+echo
+echo "=== Creating query.py ==="
+
+cat > query.py <<PYEOF
+from google.auth import compute_engine
+from google.cloud import bigquery
+
+credentials = compute_engine.Credentials(
+    service_account_email='${BQ_SA_EMAIL}',
+    scopes=['https://www.googleapis.com/auth/cloud-platform']
+)
+
+query = '''
+SELECT name, SUM(number) AS total_people
+FROM \`bigquery-public-data.usa_names.usa_1910_2013\`
+WHERE state = 'TX'
+GROUP BY name, state
+ORDER BY total_people DESC
+LIMIT 20
+'''
+
+client = bigquery.Client(
+    project='${PROJECT_ID}',
+    credentials=credentials
+)
+
+print(client.query(query).to_dataframe())
+PYEOF
+
+# ---------- REMOTE INSTALLATION SCRIPT ----------
+cat > remote_bq.sh <<'REMOTEEOF'
+#!/bin/bash
+set -e
+
+echo "Updating package lists..."
+
+sudo apt-get update -y
+
+# IMPORTANT FIX: Install venv before creating virtual environment
+sudo apt-get install -y python3-venv python3-pip git
+
+echo "Creating Python virtual environment..."
+
+python3 -m venv ~/myvenv
+
+source ~/myvenv/bin/activate
+
+echo "Installing BigQuery dependencies..."
+
+python -m pip install --upgrade pip
+
+python -m pip install \
+  google-cloud-bigquery \
+  pyarrow \
+  pandas \
+  db-dtypes
+
+echo "Executing BigQuery query..."
+
+python query.py
+
+echo "BigQuery query completed successfully."
+REMOTEEOF
+
+# ---------- COPY FILES TO VM ----------
+echo
+echo "=== Copying files to BigQuery VM ==="
+
+copied=0
+
+for i in 1 2 3 4 5 6 7 8; do
+  if gcloud compute scp query.py remote_bq.sh \
+    "${BQ_VM}:~" --zone="$ZONE" --quiet; then
+    copied=1
+    break
+  fi
+
+  echo "VM not ready. Waiting 20 seconds..."
+  sleep 20
+done
+
+[ "$copied" = 1 ] || die "Could not copy files to BigQuery VM"
+
+# ---------- RUN BIGQUERY ON VM ----------
+echo
+echo "=== Installing dependencies and running query ==="
+
+gcloud compute ssh "$BQ_VM" \
+  --zone="$ZONE" \
+  --quiet \
+  --command="bash remote_bq.sh" 2>&1 | tee bq_output.txt
+
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  die "BigQuery execution failed. Check bq_output.txt"
+fi
+
+if ! grep -q "total_people" bq_output.txt; then
+  die "BigQuery output was not detected. Check bq_output.txt"
+fi
+
+pause "Task 6 - BigQuery client libraries (20)"
+
+# ---------- SELF CHECK ----------
+echo
+echo "=================== SELF CHECK ==================="
+
+ok()  { echo " PASS: $1"; }
+bad() { echo " FAIL: $1"; }
+
+roles_of() {
+  gcloud projects get-iam-policy "$PROJECT_ID" \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$1" \
+    --format="value(bindings.role)" 2>/dev/null
+}
+
+gcloud iam service-accounts describe "$SA_EMAIL" >/dev/null 2>&1 &&
+  ok "Task 2: devops service account exists" ||
+  bad "Task 2: devops service account missing"
+
+R1=$(roles_of "$SA_EMAIL")
+
+echo "$R1" | grep -q "roles/iam.serviceAccountUser" &&
+  ok "Task 3: serviceAccountUser" || bad "Task 3: serviceAccountUser missing"
+
+echo "$R1" | grep -q "roles/compute.instanceAdmin" &&
+  ok "Task 3: compute.instanceAdmin" || bad "Task 3: compute.instanceAdmin missing"
+
+[ "$(gcloud compute instances describe "$VM1" \
+  --zone="$ZONE" --format='value(serviceAccounts[0].email)' 2>/dev/null)" = "$SA_EMAIL" ] &&
+  ok "Task 4: devops VM attachment" || bad "Task 4: VM attachment"
+
+PERMS=$(gcloud iam roles describe "$ROLE_ID" \
+  --project="$PROJECT_ID" --format="value(includedPermissions)" 2>/dev/null)
+
+echo "$PERMS" | grep -q "cloudsql.instances.connect" &&
+echo "$PERMS" | grep -q "cloudsql.instances.get" &&
+  ok "Task 5: custom role permissions" || bad "Task 5: custom role permissions"
+
+R2=$(roles_of "$BQ_SA_EMAIL")
+
+echo "$R2" | grep -q "roles/bigquery.dataViewer" &&
+echo "$R2" | grep -q "roles/bigquery.user" &&
+  ok "Task 6: BigQuery IAM roles" || bad "Task 6: BigQuery IAM roles"
+
+[ "$(gcloud compute instances describe "$BQ_VM" \
+  --zone="$ZONE" --format='value(serviceAccounts[0].email)' 2>/dev/null)" = "$BQ_SA_EMAIL" ] &&
+  ok "Task 6: BigQuery VM attachment" || bad "Task 6: VM attachment"
+
+grep -q "total_people" bq_output.txt &&
+  ok "Task 6: BigQuery query output" || bad "Task 6: query output"
+
+echo
+echo "======================================"
+echo " ARC134 SCRIPT EXECUTION COMPLETED"
+echo "======================================"
+echo "Project: $PROJECT_ID"
+echo "Region: $REGION"
+echo "Zone: $ZONE"
+echo
+echo "Return to Google Skills and verify all five checkpoints."
+LABEOF
+
+# RUN THE SCRIPT AUTOMATICALLY
+bash lab5.sh
