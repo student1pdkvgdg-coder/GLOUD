@@ -125,3 +125,4 @@ echo "Frontend : http://$FRONTEND_IP   -> HTTP $(curl -s -o /dev/null -w '%{http
 echo
 echo ">>> Done. On the lab page, click 'Check my progress' on every task."
 LABEOF
+bash lab3.sh
